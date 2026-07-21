@@ -27,19 +27,12 @@ mod material_writer;
 mod renewal_input;
 
 use api::{tas_certify, tas_get_alpha_nonce};
-use csr::{build_plain_csr, generate_tee_common_name};
+use csr::{build_plain_csr, generate_tee_common_name, parse_common_name, parse_san, SanEntry};
 use keygen::{AgentKey, KeyAlgorithm};
 
-/// Experimental certify/renew command-line flags.
-///
-/// Flattened into the top-level CLI so the flag names (`--certify`, `--renew`,
-/// `--write-dir`, `--force`) and help text live entirely within this module.
+/// Experimental certify/renew command-line flags for the `certify` subcommand.
 #[derive(Args)]
 pub struct CertifyArgs {
-    /// Generate a plain CSR and bound TEE evidence for the TAS certify flow
-    #[arg(long)]
-    certify: bool,
-
     /// Renew an existing certificate (requires --write-dir)
     #[arg(long)]
     renew: bool,
@@ -51,18 +44,27 @@ pub struct CertifyArgs {
     /// Allow overwriting existing key.pem during re-certification
     #[arg(long)]
     force: bool,
+
+    /// Subject Common Name for the CSR (default: auto-generated from hostname/UUID)
+    #[arg(long = "common-name", visible_alias = "cn", value_name = "CN", value_parser = parse_common_name)]
+    common_name: Option<String>,
+
+    /// Subject Alternative Name to request; repeatable. Format: TYPE:VALUE
+    /// where TYPE is one of DNS, IP, URI, email (e.g. --san DNS:host.example.com)
+    #[arg(long = "san", value_name = "TYPE:VALUE", value_parser = parse_san)]
+    sans: Vec<SanEntry>,
 }
 
-/// Experimental certify/renew configuration keys.
+/// Experimental certify configuration keys.
 ///
-/// Flattened into the top-level config so the TOML keys (`certify`, `renew`,
-/// `write_dir`, `force`) stay top-level while their definitions live here.
+/// Flattened into the top-level config so the TOML keys (`write_dir`, `force`,
+/// `common_name`, `sans`) stay top-level while their definitions live here.
 #[derive(Deserialize, Default)]
 pub struct CertifyConfig {
-    certify: Option<bool>,
-    renew: Option<bool>,
     write_dir: Option<PathBuf>,
     force: Option<bool>,
+    common_name: Option<String>,
+    sans: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -71,48 +73,58 @@ enum CertifyMode {
     Renew,
 }
 
-/// Pure predicate: is certify/renew mode requested from the resolved inputs?
-fn mode_requested(
-    cli_certify: bool,
-    cli_renew: bool,
-    cfg_certify: Option<bool>,
-    cfg_renew: Option<bool>,
-) -> bool {
-    cli_certify || cli_renew || cfg_certify.unwrap_or(false) || cfg_renew.unwrap_or(false)
-}
-
-/// Whether the user requested certify or renew via CLI flags or config.
-fn certify_mode_requested(cli: &Cli, cfg: &Config) -> bool {
-    let args = &cli.certify_args;
-    let cfg = &cfg.certify_config;
-    mode_requested(args.certify, args.renew, cfg.certify, cfg.renew)
-}
-
-/// Run the certify/renew flow if requested.
+/// Runs the certify/renew flow for the `certify` subcommand.
 ///
-/// Returns `Ok(false)` when certify/renew was not requested (caller continues
-/// with the normal key-fetch flow), `Ok(true)` after the flow handled the run,
-/// and `Err(_)` for input or flow failures (caller logs and exits).
-pub(super) async fn run_if_requested(cli: &Cli, cfg: &Config) -> Result<bool> {
-    if !certify_mode_requested(cli, cfg) {
-        return Ok(false);
-    }
-
-    let args = &cli.certify_args;
+/// Resolves the write directory, mode, common name, and SANs from the CLI
+/// arguments and config (CLI overrides config), then performs the certify or
+/// renew flow. In debug mode the issued certificate bundle is written to stdout.
+///
+/// # Errors
+///
+/// Returns an error for missing required inputs, invalid common name or SAN
+/// values, or any failure in the certify flow.
+pub(super) async fn run(cli: &Cli, args: &CertifyArgs, cfg: &Config) -> Result<()> {
     let cert_cfg = &cfg.certify_config;
 
     let write_dir = args
         .write_dir
         .clone()
         .or_else(|| cert_cfg.write_dir.clone())
-        .ok_or_else(|| anyhow!("--write-dir is required for --certify or --renew"))?;
+        .ok_or_else(|| anyhow!("--write-dir is required for the certify command"))?;
 
-    let mode = if args.renew || cert_cfg.renew.unwrap_or(false) {
+    let mode = if args.renew {
         CertifyMode::Renew
     } else {
         CertifyMode::Fresh {
             force: args.force || cert_cfg.force.unwrap_or(false),
         }
+    };
+
+    // Common name: CLI overrides config; validated here. None => auto-generated
+    // in the certify flow, preserving the historical default behaviour.
+    let common_name = match args
+        .common_name
+        .clone()
+        .or_else(|| cert_cfg.common_name.clone())
+    {
+        Some(cn) => {
+            Some(parse_common_name(&cn).map_err(|e| anyhow!("invalid common name: {}", e))?)
+        }
+        None => None,
+    };
+
+    // SANs: CLI overrides config (replace). Config strings are validated the
+    // same way as CLI values via parse_san. Applied identically for fresh and
+    // renew, so a configured SAN set is stable across renewals.
+    let sans: Vec<SanEntry> = if !args.sans.is_empty() {
+        args.sans.clone()
+    } else if let Some(cfg_sans) = &cert_cfg.sans {
+        cfg_sans
+            .iter()
+            .map(|s| parse_san(s).map_err(|e| anyhow!("invalid SAN in config: {}", e)))
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        Vec::new()
     };
 
     let overrides = CliOverrides {
@@ -125,8 +137,15 @@ pub(super) async fn run_if_requested(cli: &Cli, cfg: &Config) -> Result<bool> {
         retry_max_backoff_secs: cli.retry_max_backoff_secs,
     };
 
-    let cert_bundle_pem =
-        certify_flow(cli.config.clone(), Some(overrides), Some(write_dir), mode).await?;
+    let cert_bundle_pem = certify_flow(
+        cli.config.clone(),
+        Some(overrides),
+        Some(write_dir),
+        mode,
+        common_name,
+        sans,
+    )
+    .await?;
 
     if cli.debug {
         use std::io::Write;
@@ -135,7 +154,7 @@ pub(super) async fn run_if_requested(cli: &Cli, cfg: &Config) -> Result<bool> {
             .map_err(|e| anyhow!("failed to write certificate to stdout: {}", e))?;
     }
 
-    Ok(true)
+    Ok(())
 }
 
 async fn certify_flow(
@@ -143,6 +162,8 @@ async fn certify_flow(
     overrides: Option<CliOverrides>,
     write_dir: Option<PathBuf>,
     mode: CertifyMode,
+    common_name: Option<String>,
+    sans: Vec<SanEntry>,
 ) -> Result<String> {
     warn!("EXPERIMENTAL: certify/renew lifecycle is not production-ready");
     let cfg = load_config(config_path)?;
@@ -226,9 +247,9 @@ async fn certify_flow(
         }
     };
     debug!("Certify key obtained");
-    let common_name = generate_tee_common_name();
+    let common_name = common_name.unwrap_or_else(generate_tee_common_name);
     debug!("Building plain CSR for CN: {}", common_name);
-    let csr_pem = build_plain_csr(&agent_key, &common_name)
+    let csr_pem = build_plain_csr(&agent_key, &common_name, &sans)
         .map_err(|e| anyhow!("failed to build CSR: {}", e))?;
     debug!("Generated certify CSR subject CN: {}", common_name);
 
@@ -293,14 +314,8 @@ async fn certify_flow(
                 &write_dir,
                 &key_pem,
                 &issued.certificate,
-                &issued.ca_chain.join(
-                    "
-",
-                ),
-                &issued.ca_chain.join(
-                    "
-",
-                ),
+                &issued.ca_chain.join("\n"),
+                &issued.ca_chain.join("\n"),
                 force,
             )
             .context("failed to write initial certificate materials")?;
@@ -310,14 +325,8 @@ async fn certify_flow(
             material_writer::write_renewed_materials(
                 &write_dir,
                 &issued.certificate,
-                &issued.ca_chain.join(
-                    "
-",
-                ),
-                &issued.ca_chain.join(
-                    "
-",
-                ),
+                &issued.ca_chain.join("\n"),
+                &issued.ca_chain.join("\n"),
             )
             .context("failed to write renewed certificate materials")?;
             debug!("Wrote renewed certificate materials to {:?}", write_dir);
@@ -331,35 +340,4 @@ async fn certify_flow(
     }
 
     Ok(output)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::mode_requested;
-
-    #[test]
-    fn mode_requested_none() {
-        assert!(!mode_requested(false, false, None, None));
-        assert!(!mode_requested(false, false, Some(false), Some(false)));
-    }
-
-    #[test]
-    fn mode_requested_cli_certify() {
-        assert!(mode_requested(true, false, None, None));
-    }
-
-    #[test]
-    fn mode_requested_cli_renew() {
-        assert!(mode_requested(false, true, None, None));
-    }
-
-    #[test]
-    fn mode_requested_cfg_certify() {
-        assert!(mode_requested(false, false, Some(true), None));
-    }
-
-    #[test]
-    fn mode_requested_cfg_renew() {
-        assert!(mode_requested(false, false, None, Some(true)));
-    }
 }

@@ -32,7 +32,7 @@ mod tas_api;
 mod tee_evidence;
 mod utils;
 use anyhow::{anyhow, Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use serde::Deserialize;
 
 use crypto::{
@@ -68,49 +68,45 @@ impl log::Log for SimpleLogger {
 #[command(author, version, about, long_about = None)]
 struct Cli {
     /// Display debugging messages
-    #[arg(short, long)]
+    #[arg(short, long, global = true)]
     debug: bool,
 
-    #[cfg(feature = "certify")]
-    #[command(flatten)]
-    certify_args: certify::CertifyArgs,
-
     /// Path to the config file (default: '/etc/tas_agent/config.toml')
-    #[arg(short, long, value_name = "FILE")]
+    #[arg(short, long, value_name = "FILE", global = true)]
     config: Option<PathBuf>,
 
     /// The URI of the TAS REST service
-    #[arg(long, value_name = "URI")]
+    #[arg(long, value_name = "URI", global = true)]
     server_uri: Option<String>,
 
     /// Path to the API key for the TAS REST service
-    #[arg(long, value_name = "FILE")]
+    #[arg(long, value_name = "FILE", global = true)]
     api_key: Option<PathBuf>,
 
     /// Policy ID to request from the TAS REST service
-    #[arg(long, value_name = "ID")]
+    #[arg(long, value_name = "ID", global = true)]
     policy_id: Option<String>,
 
     /// Path to the CA root certificate signing the TAS REST service cert
-    #[arg(long, value_name = "FILE")]
+    #[arg(long, value_name = "FILE", global = true)]
     cert_path: Option<PathBuf>,
 
     /// Maximum number of retry attempts for HTTP requests (default: 3)
-    #[arg(long, value_name = "N")]
+    #[arg(long, value_name = "N", global = true)]
     max_retries: Option<u32>,
 
     /// Minimum backoff time in seconds between retries (default: 1)
-    #[arg(long, value_name = "SECS")]
+    #[arg(long, value_name = "SECS", global = true)]
     retry_min_backoff_secs: Option<u64>,
 
     /// Maximum backoff time in seconds between retries (default: 30)
-    #[arg(long, value_name = "SECS")]
+    #[arg(long, value_name = "SECS", global = true)]
     retry_max_backoff_secs: Option<u64>,
 
     /// Disable GPU attestation (enabled by default when built with GPU support)
     // Any GPU feature
     #[cfg(feature = "gpu-nvidia")]
-    #[arg(long)]
+    #[arg(long, global = true)]
     no_gpu: bool,
 
     /// Enable systemd ask-password watcher mode for automatic LUKS unlock
@@ -122,6 +118,22 @@ struct Cli {
     #[cfg(feature = "passfifo")]
     #[arg(long)]
     passfifo: bool,
+
+    /// Subcommand to run; when omitted the agent performs the default key fetch.
+    #[command(subcommand)]
+    #[allow(dead_code)]
+    command: Option<Commands>,
+}
+
+/// Top-level subcommands.
+#[derive(Subcommand)]
+enum Commands {
+    /// Fetch and unwrap a secret key (default when no subcommand is given)
+    Fetch,
+
+    /// Obtain or renew an attestation-bound certificate (EXPERIMENTAL)
+    #[cfg(feature = "certify")]
+    Certify(certify::CertifyArgs),
 }
 
 #[derive(Deserialize, Default)]
@@ -440,7 +452,7 @@ async fn main() {
     }
 
     #[cfg(feature = "certify")]
-    {
+    if let Some(Commands::Certify(args)) = &cli.command {
         let cfg = match load_config(cli.config.clone()) {
             Ok(cfg) => cfg,
             Err(e) => {
@@ -448,14 +460,11 @@ async fn main() {
                 std::process::exit(1);
             }
         };
-        match certify::run_if_requested(&cli, &cfg).await {
-            Ok(true) => return,
-            Ok(false) => {}
-            Err(e) => {
-                eprintln!("{:#}", e);
-                std::process::exit(1);
-            }
+        if let Err(e) = certify::run(&cli, args, &cfg).await {
+            eprintln!("{:#}", e);
+            std::process::exit(1);
         }
+        return;
     }
     let overrides = CliOverrides {
         server_uri: cli.server_uri,

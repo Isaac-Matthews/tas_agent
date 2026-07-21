@@ -18,19 +18,23 @@ key.
 
 Two lifecycle operations are supported:
 
-- **Initial certification** (`--certify`): generates a fresh RSA-4096 key,
+- **Initial certification** (`certify`): generates a fresh RSA-4096 key,
   builds a CSR, gathers TEE evidence, and requests a new certificate.
-- **Renewal** (`--renew`): reuses the previously generated private key and the
-  previously issued certificate to request a refreshed certificate.
+- **Renewal** (`certify --renew`): reuses the previously generated private key
+  and the previously issued certificate to request a refreshed certificate.
 
-The agent sets the CSR subject Common Name (CN) from the host's identity: it
-uses the host's fully-qualified domain name (FQDN) when one is available, and
-otherwise falls back to the short hostname. A short random suffix is appended to
-the CN.
+By default the agent sets the CSR subject Common Name (CN) from the host's
+identity: it uses the host's fully-qualified domain name (FQDN) when one is
+available, and otherwise falls back to the short hostname, with a short random
+suffix appended. The CN can be overridden with `--common-name` (alias `--cn`) or
+the `common_name` config key. Optional Subject Alternative Names may be requested
+with repeatable `--san TYPE:VALUE` flags or the `sans` config key; both apply
+identically to initial certification and renewal.
 
 The certificate identity (SPIFFE ID / UUID) is minted server-side by TAS. The
-agent's CSR only contributes the public key and this CN; the agent never asserts
-its own identity.
+agent's CSR only contributes the public key, CN, and any requested SANs; the
+agent never asserts its own identity, and TAS remains authoritative over what it
+signs.
 
 ## Building
 
@@ -57,22 +61,23 @@ All certify/renew code lives under the feature-gated `src/certify/` module and
 is compiled only with `--features certify`. The rest of the codebase contains no
 certify-specific logic, so the feature can be developed in isolation:
 
-- `src/certify/mod.rs` — flow orchestration (`certify_flow`), CLI/config
-  dispatch (`run_if_requested`), the experimental runtime warning, and the
+- `src/certify/mod.rs` — flow orchestration (`certify_flow`), the `certify`
+  subcommand entry point (`run`), the experimental runtime warning, and the
   `CertifyArgs` / `CertifyConfig` structs that define the certify CLI flags and
   config keys.
 - `src/certify/api.rs` — certify/renew TAS REST calls (`tas_certify`,
   `tas_get_alpha_nonce`) and their request/response payload types.
 - `src/certify/keygen.rs` — RSA-4096 key generation.
-- `src/certify/csr.rs` — CSR construction and Common Name derivation.
+- `src/certify/csr.rs` — CSR construction, Common Name derivation, and SAN/CN
+  parsing and validation (`parse_san`, `parse_common_name`).
 - `src/certify/material_writer.rs` — atomic on-disk material writes.
 - `src/certify/renewal_input.rs` — loading existing key/cert for renewal.
 
-The certify CLI flags and config keys are defined as `CertifyArgs` /
-`CertifyConfig` inside the module and flattened (`#[command(flatten)]` /
-`#[serde(flatten)]`) into the top-level `Cli` / `Config` in `src/main.rs`. The
-flag names (`--certify`, `--renew`, `--write-dir`, `--force`) and TOML keys stay
-identical; only their definitions moved into the module.
+The certify flow is exposed as the `certify` subcommand: `CertifyArgs` is the
+subcommand body (`Commands::Certify` in `src/main.rs`) and `CertifyConfig` is
+flattened (`#[serde(flatten)]`) into the top-level `Config` to supply defaults.
+Shared connection flags (`--server-uri`, `--policy-id`, ...) are global, so they
+may appear before or after the `certify` token.
 
 The core `src/tas_api.rs` holds only the non-experimental endpoints. The certify
 API in `src/certify/api.rs` reuses its `pub(crate)` `create_client` helper, so
@@ -89,14 +94,17 @@ EXPERIMENTAL: certify/renew lifecycle is not production-ready
 
 ## Command-line flags
 
-The following flags are only available when compiled with `--features certify`:
+The certify flow is invoked as a subcommand: `tas_agent certify [OPTIONS]`. The
+following flags are available on the `certify` subcommand (only when compiled
+with `--features certify`):
 
 | Flag | Argument | Description |
 | --- | --- | --- |
-| `--certify` | _(none)_ | Initial certification mode. Generates a new key and requests a certificate. |
-| `--renew` | _(none)_ | Renewal mode. Reuses the existing key and certificate from `--write-dir`. |
-| `--write-dir <DIR>` | directory | **Required** for `--certify` and `--renew`. Directory where key/certificate materials are written and read. |
+| `--renew` | _(none)_ | Renewal mode. Reuses the existing key and certificate from `--write-dir`. Without it, `certify` performs initial certification. |
+| `--write-dir <DIR>` | directory | **Required.** Directory where key/certificate materials are written and read. |
 | `--force` | _(none)_ | Allow overwriting an existing `key.pem` during initial certification. |
+| `--common-name <CN>`, `--cn` | string | Override the CSR subject Common Name (default: auto-generated). Max 64 chars; RFC 4514 DN metacharacters and control characters are rejected. |
+| `--san <TYPE:VALUE>` | repeatable | Request a Subject Alternative Name. `TYPE` is one of `DNS`, `IP`, `URI`, `email` (case-insensitive). Overrides the `sans` config key when given. |
 
 These shared flags also apply:
 
@@ -114,21 +122,23 @@ These shared flags also apply:
 
 ## Configuration file
 
-The lifecycle flags may also be set in the TOML config file instead of (or in
-addition to) the command line. CLI flags take precedence over config values.
+Config keys supply defaults for the `certify` subcommand; CLI flags take
+precedence over config values. The mode is always chosen with the `certify`
+subcommand and its command-line options.
 
 ```toml
-# Enable certificate certification mode
-certify = true
-
-# Enable renewal mode (mutually exclusive intent with certify; renew takes priority)
-# renew = true
-
 # Directory for certificate materials (equivalent to --write-dir)
 write_dir = "/var/lib/tas_agent/certs"
 
-# Allow overwriting an existing key.pem during certification
+# Allow overwriting an existing key.pem during initial certification
 # force = false
+
+# Override the CSR subject Common Name (default: auto-generated)
+# common_name = "tee.host.example.com"
+
+# Subject Alternative Names to request (OpenSSL TYPE:VALUE form). A --san flag on
+# the command line overrides this list. Applied for both fresh and renew.
+# sans = ["DNS:host.example.com", "IP:10.0.0.1", "URI:spiffe://td/workload"]
 ```
 
 The existing `server_uri`, `api_key`, `policy_id`, `cert_path`, and retry
@@ -161,7 +171,7 @@ write directory.
 ```bash
 sudo target/debug/tas_agent -d \
   -c ~/config.toml \
-  --certify \
+  certify \
   --write-dir /var/lib/tas_agent/certs
 ```
 
@@ -170,8 +180,19 @@ To overwrite an existing `key.pem` (re-certify from scratch), add `--force`:
 ```bash
 sudo target/debug/tas_agent -d \
   -c ~/config.toml \
-  --certify --force \
+  certify --force \
   --write-dir /var/lib/tas_agent/certs
+```
+
+To set a custom Common Name and request Subject Alternative Names:
+
+```bash
+sudo target/debug/tas_agent -d \
+  -c ~/config.toml \
+  certify \
+  --write-dir /var/lib/tas_agent/certs \
+  --common-name tee.web.example.com \
+  --san DNS:web.example.com --san IP:10.0.0.1 --san URI:spiffe://td/workload
 ```
 
 ### Renewal
@@ -183,7 +204,7 @@ a refreshed certificate, and atomically updates `cert.pem`, `chain.pem`, and
 ```bash
 sudo target/debug/tas_agent -d \
   -c ~/config.toml \
-  --renew \
+  certify --renew \
   --write-dir /var/lib/tas_agent/certs
 ```
 
