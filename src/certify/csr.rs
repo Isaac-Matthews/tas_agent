@@ -131,46 +131,21 @@ pub fn parse_common_name(s: &str) -> Result<String, String> {
 
 pub fn generate_tee_common_name() -> String {
     let uuid = Uuid::new_v4();
-
-    if let Some(fqdn) = preferred_fqdn_for_cn() {
-        return generate_tee_common_name_from_fqdn(Some(&fqdn), uuid);
-    }
-
     let hostname = hostname::get()
         .ok()
         .and_then(|name| name.into_string().ok())
         .map(|name| name.trim().to_string())
         .filter(|name| !name.is_empty());
-    generate_tee_common_name_from_hostname(hostname.as_deref(), uuid)
+    generate_tee_common_name_from_system_hostname(hostname.as_deref(), uuid)
 }
 
-fn preferred_fqdn_for_cn() -> Option<String> {
-    #[cfg(unix)]
-    {
-        if let Some(fqdn) = try_get_fqdn_from_hostname_command() {
-            return Some(fqdn);
+fn generate_tee_common_name_from_system_hostname(hostname: Option<&str>, uuid: Uuid) -> String {
+    match hostname {
+        Some(hostname) if hostname.contains('.') => {
+            generate_tee_common_name_from_fqdn(Some(hostname), uuid)
         }
+        _ => generate_tee_common_name_from_hostname(hostname, uuid),
     }
-
-    None
-}
-
-#[cfg(unix)]
-fn try_get_fqdn_from_hostname_command() -> Option<String> {
-    use std::process::Command;
-
-    let output = Command::new("hostname").arg("-f").output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let fqdn = String::from_utf8(output.stdout).ok()?;
-    let fqdn = fqdn.trim();
-    if fqdn.is_empty() || !fqdn.contains('.') {
-        return None;
-    }
-
-    Some(fqdn.to_string())
 }
 
 fn generate_tee_common_name_from_fqdn(hostname: Option<&str>, uuid: Uuid) -> String {
@@ -367,6 +342,34 @@ mod tests {
         let uuid = Uuid::parse_str("3f2a9c14-8b7d-4e21-a9f0-1c2d3e4f5a6b").unwrap();
         let cn = generate_tee_common_name_from_hostname(Some("CVM_Prod.01"), uuid);
         assert_eq!(cn, "tas.cvm-prod-01-3f2a9c148b7d");
+    }
+
+    #[test]
+    fn system_hostname_selects_fqdn_or_short_hostname_format() {
+        let uuid = Uuid::parse_str("3f2a9c14-8b7d-4e21-a9f0-1c2d3e4f5a6b").unwrap();
+
+        assert_eq!(
+            generate_tee_common_name_from_system_hostname(Some("node1.example.com"), uuid),
+            "tee.node1.example.com-3f2a9c148b7d"
+        );
+        assert_eq!(
+            generate_tee_common_name_from_system_hostname(Some("node1"), uuid),
+            "tas.node1-3f2a9c148b7d"
+        );
+    }
+
+    #[test]
+    fn system_hostname_falls_back_to_unknown() {
+        let uuid = Uuid::parse_str("3f2a9c14-8b7d-4e21-a9f0-1c2d3e4f5a6b").unwrap();
+
+        assert_eq!(
+            generate_tee_common_name_from_system_hostname(None, uuid),
+            "tas.unknown-3f2a9c148b7d"
+        );
+        assert_eq!(
+            generate_tee_common_name_from_system_hostname(Some(""), uuid),
+            "tas.unknown-3f2a9c148b7d"
+        );
     }
 
     #[test]

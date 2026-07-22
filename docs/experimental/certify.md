@@ -23,13 +23,13 @@ Two lifecycle operations are supported:
 - **Renewal** (`certify --renew`): reuses the previously generated private key
   and the previously issued certificate to request a refreshed certificate.
 
-By default the agent sets the CSR subject Common Name (CN) from the host's
-identity: it uses the host's fully-qualified domain name (FQDN) when one is
-available, and otherwise falls back to the short hostname, with a short random
-suffix appended. The CN can be overridden with `--common-name` (alias `--cn`) or
-the `common_name` config key. Optional Subject Alternative Names may be requested
-with repeatable `--san TYPE:VALUE` flags or the `sans` config key; both apply
-identically to initial certification and renewal.
+By default the agent sets the CSR subject Common Name (CN) from the configured
+system hostname. A hostname containing a dot is treated as a fully-qualified
+domain name (FQDN); otherwise the agent uses the short hostname. A short random
+suffix is appended in either case. The CN can be overridden with `--common-name`
+(alias `--cn`) or the `common_name` config key. Optional Subject Alternative
+Names may be requested with repeatable `--san TYPE:VALUE` flags or the `sans`
+config key; both apply identically to initial certification and renewal.
 
 The certificate identity (SPIFFE ID / UUID) is minted server-side by TAS. The
 agent's CSR only contributes the public key, CN, and any requested SANs; the
