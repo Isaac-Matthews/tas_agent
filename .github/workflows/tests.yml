@@ -11,7 +11,8 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Feature matrix: check + test each feature combination
+  # Feature matrix: Cargo features are additive, 
+  # so we test the default build and a build with all features enabled.
   # ---------------------------------------------------------------------------
   feature-matrix:
     runs-on: ubuntu-latest
@@ -20,23 +21,19 @@ jobs:
       matrix:
         features:
           - ""
-          - "askpass"
-          - "passfifo"
-          - "askpass,passfifo"
+          - "certify,askpass,passfifo"
     steps:
     - uses: actions/checkout@v3
     - uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
         toolchain: stable
-
-    - name: Cargo check
-      run: cargo check ${{ matrix.features && format('--features {0}', matrix.features) }}
+    - uses: Swatinem/rust-cache@v2
 
     - name: Cargo test
-      run: cargo test ${{ matrix.features && format('--features {0}', matrix.features) }}
+      run: cargo test --all-targets ${{ matrix.features && format('--features {0}', matrix.features) }}
 
   # ---------------------------------------------------------------------------
-  # Full build + docs (all features enabled)
+  # Static checks, release build, docs, and distribution build.
   # ---------------------------------------------------------------------------
   rust-checks:
     runs-on: ubuntu-latest
@@ -46,21 +43,28 @@ jobs:
       with:
         toolchain: stable
         components: rustfmt, clippy
+    - uses: Swatinem/rust-cache@v2
 
-    - name: Build debug
-      run: cargo build --features askpass,passfifo
+    - name: Check formatting
+      run: cargo fmt --check
+
+    - name: Check isolated features
+      run: |
+        cargo check --features askpass
+        cargo check --features passfifo
+        cargo check --features certify
+
+    - name: Run clippy
+      run: cargo clippy --all-targets --features certify,askpass,passfifo -- -D warnings
 
     - name: Build release
-      run: cargo build --release --features askpass,passfifo
-
-    - name: Run tests (debug)
-      run: cargo test --features askpass,passfifo
+      run: cargo build --release --features certify,askpass,passfifo
 
     - name: Run tests (release)
-      run: cargo test --release --features askpass,passfifo
+      run: cargo test --release --all-targets --features certify,askpass,passfifo
 
     - name: Build docs
-      run: cargo doc --no-deps --features askpass,passfifo
+      run: cargo doc --no-deps --features certify,askpass,passfifo
 
     - name: Build via script
       run: |
@@ -78,6 +82,7 @@ jobs:
     - uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
         toolchain: stable
+    - uses: Swatinem/rust-cache@v2
 
     - name: Install packaging deps
       run: sudo apt-get update && sudo apt-get install -y dpkg-dev debhelper fakeroot pkg-config libssl-dev
@@ -103,6 +108,7 @@ jobs:
     - uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
         toolchain: stable
+    - uses: Swatinem/rust-cache@v2
 
     - name: Install packaging deps
       run: sudo apt-get update && sudo apt-get install -y rpm pkg-config libssl-dev
@@ -141,23 +147,37 @@ jobs:
     - uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
         toolchain: stable
+    - uses: Swatinem/rust-cache@v2
 
     # System packages needed to build the C++ SDK and generate Rust bindings.
-    # The SDK statically builds OpenSSL/curl/xmlsec itself, so we only need the
-    # toolchain, libclang (bindgen), and libxml2/zlib (found via find_package).
+    # CI uses the SDK's supported system-dependency mode to avoid rebuilding
+    # OpenSSL, curl, and xmlsec from source on every cold cache.
     - name: Install SDK build dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y \
           build-essential cmake pkg-config git perl \
           clang libclang-dev \
+          libssl-dev libcurl4-openssl-dev libxmlsec1-dev \
           libxml2-dev zlib1g-dev
+
+    - name: Identify runner image
+      id: runner-image
+      run: echo "image=${ImageOS:-unknown}-${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+
+    - name: Restore libnvat cache
+      id: libnvat-cache
+      uses: actions/cache@v4
+      with:
+        path: .cache/libnvat-install
+        key: libnvat-${{ runner.os }}-${{ runner.arch }}-${{ steps.runner-image.outputs.image }}-${{ hashFiles('Cargo.toml', '.github/workflows/tests.yml') }}
 
     # Build libnvat from the exact git tag referenced in Cargo.toml so the ABI
     # matches the crate the `gpu-nvidia` feature pulls in, then install it to
     # /usr so the sys-crate's NVAT_USE_SYSTEM_LIB mode finds /usr/include/nvat.h
     # and /usr/lib/libnvat.so.
     - name: Build and install libnvat (NVIDIA Attestation SDK)
+      if: steps.libnvat-cache.outputs.cache-hit != 'true'
       # Allow warnings for the SDK build only, due to warnings from SDK dependencies
       env:
         RUSTFLAGS: "-A warnings"
@@ -170,6 +190,7 @@ jobs:
         cmake -S /tmp/attestation-sdk/nv-attestation-sdk-cpp -B /tmp/attestation-sdk/build \
           -DCMAKE_BUILD_TYPE=Release \
           -DBUILD_SHARED_LIBS=ON \
+          -DUSE_SYSTEM_DEPS=ON \
           -DCMAKE_INSTALL_PREFIX=/usr \
           -DCMAKE_INSTALL_LIBDIR=lib \
           -DCMAKE_BUILD_PARALLEL_LEVEL="$(nproc)"
@@ -177,15 +198,14 @@ jobs:
           echo "::warning::Parallel SDK build failed; retrying serially to surface the real error"
           cmake --build /tmp/attestation-sdk/build -j1 --verbose
         fi
-        sudo cmake --install /tmp/attestation-sdk/build
-        sudo ldconfig
+        DESTDIR="$PWD/.cache/libnvat-install" cmake --install /tmp/attestation-sdk/build
 
-    - name: Cargo check (gpu-nvidia)
-      env:
-        NVAT_USE_SYSTEM_LIB: "1"
-      run: cargo check --features gpu-nvidia,askpass,passfifo
+    - name: Install libnvat
+      run: |
+        sudo cp -a .cache/libnvat-install/usr/. /usr/
+        sudo ldconfig
 
     - name: Cargo test (gpu-nvidia)
       env:
         NVAT_USE_SYSTEM_LIB: "1"
-      run: cargo test --features gpu-nvidia,askpass,passfifo
+      run: cargo test --all-targets --features gpu-nvidia,certify,askpass,passfifo

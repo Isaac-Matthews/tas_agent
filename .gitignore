@@ -41,3 +41,6 @@ debian
 tas-agent-tests/
 tas_agent_tests/
 testing/
+
+#Ignore Nvidia GPU SDK artifacts
+attestation-sdk/

@@ -37,7 +37,7 @@ struct CertifyRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none", rename = "renew_cert")]
     renew_cert: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "gpu-evidence")]
-    gpu_evidence: Option<&'a serde_json::Value>,
+    gpu_evidence: Option<&'a [serde_json::Value]>,
 }
 
 pub async fn tas_get_alpha_nonce(
@@ -92,7 +92,7 @@ pub async fn tas_certify(
     policy_domain: &str,
     cert_path: PathBuf,
     retry_config: &RetryConfig,
-    gpu_evidence: Option<&serde_json::Value>,
+    gpu_evidence: Option<&[serde_json::Value]>,
 ) -> Result<CertifyResponse, String> {
     let certify_url = format!("{}/alphav1/certify", server_uri);
     let client = create_client(server_uri, cert_path, retry_config)?;
@@ -305,6 +305,66 @@ CzWyyc0J/7PWdmvFVgXukRznKqZp/d4xAaQIKxLcxGwwDNp1
 
         assert!(result.certificate.contains("BEGIN CERTIFICATE"));
         assert_eq!(result.ca_chain.len(), 1);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_tas_certify_sends_gpu_evidence_as_bare_array() {
+        let csr_der = CertReq::from_pem(sample_csr_pem())
+            .unwrap()
+            .to_der()
+            .unwrap();
+        let expected_csr_b64 = general_purpose::STANDARD.encode(csr_der);
+        let gpu_evidence = vec![
+            serde_json::json!({
+                "type": "gpu-nvidia",
+                "device-index": 0,
+                "evidence": "gpu-zero"
+            }),
+            serde_json::json!({
+                "type": "gpu-nvidia",
+                "device-index": 1,
+                "evidence": "gpu-one"
+            }),
+        ];
+        let expected_body = serde_json::json!({
+            "tee-type": "amd-sev-snp",
+            "nonce": "nonce123",
+            "tee-evidence": "dGVzdC1ldmlkZW5jZQ==",
+            "csr": expected_csr_b64,
+            "policy-domain": "tenant-a",
+            "gpu-evidence": gpu_evidence,
+        })
+        .to_string();
+
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("POST", "/alphav1/certify")
+            .match_body(mockito::Matcher::JsonString(expected_body))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"certificate":"leaf","ca_chain":[]}"#)
+            .create_async()
+            .await;
+
+        let cert_file = create_test_cert();
+        let result = tas_certify(
+            &server.url(),
+            "key",
+            "nonce123",
+            "dGVzdC1ldmlkZW5jZQ==",
+            "amd-sev-snp",
+            None,
+            sample_csr_pem(),
+            "tenant-a",
+            cert_file.path().to_path_buf(),
+            &no_retry_config(),
+            Some(&gpu_evidence),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.certificate, "leaf");
         mock.assert_async().await;
     }
 

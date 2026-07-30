@@ -47,6 +47,9 @@ cargo build --features certify
 
 # Release build
 cargo build --release --features certify
+
+# Release build with NVIDIA GPU attestation
+NVAT_USE_SYSTEM_LIB=1 cargo build --release --features certify,gpu-nvidia
 ```
 
 The resulting binary is at `target/debug/tas_agent` (or
@@ -67,6 +70,8 @@ certify-specific logic, so the feature can be developed in isolation:
   config keys.
 - `src/certify/api.rs` — certify/renew TAS REST calls (`tas_certify`,
   `tas_get_alpha_nonce`) and their request/response payload types.
+- `src/certify/gpu.rs` — certify-specific adaptation of NVIDIA evidence to the
+  `gpu-evidence` API payload.
 - `src/certify/keygen.rs` — RSA-4096 key generation.
 - `src/certify/csr.rs` — CSR construction, Common Name derivation, and SAN/CN
   parsing and validation (`parse_san`, `parse_common_name`).
@@ -119,6 +124,7 @@ These shared flags also apply:
 | `--max-retries <N>` | integer | Maximum HTTP retry attempts (default: 3). |
 | `--retry-min-backoff-secs <SECS>` | integer | Minimum retry backoff in seconds (default: 1). |
 | `--retry-max-backoff-secs <SECS>` | integer | Maximum retry backoff in seconds (default: 30). |
+| `--no-gpu` | _(none)_ | Disable GPU attestation in a `certify,gpu-nvidia` build. |
 
 ## Configuration file
 
@@ -143,6 +149,20 @@ write_dir = "/var/lib/tas_agent/certs"
 
 The existing `server_uri`, `api_key`, `policy_id`, `cert_path`, and retry
 settings are shared with the normal key-fetch flow.
+
+## GPU attestation
+
+When built with both `certify` and `gpu-nvidia`, GPU attestation is enabled by
+default for initial certification and renewal. The agent collects up to 16
+NVIDIA GPU evidence entries and submits them as the certify API's bare
+`gpu-evidence` array. It binds their ordered SHA-512 hashes into the CPU TEE
+report data together with the nonce and certificate public key.
+
+GPU collection is fail-closed: collection, payload validation, or attestation
+failure stops the certify operation before certificate material is written.
+Use `--no-gpu` or `no_gpu = true` in `config.toml` for CPU-only certification.
+This opt-out does not override TAS policy; a policy requiring GPU components
+rejects a CPU-only request.
 
 ## On-disk file layout
 
@@ -238,6 +258,8 @@ openssl x509 -in /var/lib/tas_agent/certs/cert.pem -noout -serial
 - A CA root certificate for validating the TAS service certificate (for HTTPS).
 - The host must be able to produce TEE evidence (e.g., running inside a
   supported confidential VM).
+- GPU-enabled certification additionally requires `libnvat`, a supported
+  NVIDIA GPU, and a TAS policy compatible with the submitted GPU evidence.
 
 ## Limitations
 

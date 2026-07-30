@@ -16,12 +16,16 @@ use log::{debug, warn};
 use serde::Deserialize;
 
 use crate::crypto::compute_report_data_binding;
+#[cfg(feature = "gpu-nvidia")]
+use crate::crypto::compute_report_data_binding_with_components;
 use crate::tas_api::{tas_get_version, RetryConfig};
 use crate::tee_evidence::tee_get_evidence;
-use crate::{load_config, Cli, CliOverrides, Config};
+use crate::{Cli, Config};
 
 mod api;
 mod csr;
+#[cfg(feature = "gpu-nvidia")]
+mod gpu;
 mod keygen;
 mod material_writer;
 mod renewal_input;
@@ -71,6 +75,90 @@ pub struct CertifyConfig {
 enum CertifyMode {
     Fresh { force: bool },
     Renew,
+}
+
+struct CertifySettings {
+    server_uri: String,
+    api_key_path: PathBuf,
+    policy_domain: String,
+    cert_path: PathBuf,
+    retry_config: RetryConfig,
+    #[cfg(feature = "gpu-nvidia")]
+    gpu_enabled: bool,
+}
+
+impl CertifySettings {
+    fn resolve(cli: &Cli, cfg: &Config) -> Result<Self> {
+        let server_uri = cli
+            .server_uri
+            .clone()
+            .or_else(|| cfg.server_uri.clone())
+            .ok_or_else(|| anyhow!("server URI is required"))?;
+
+        if !server_uri.starts_with("http://") && !server_uri.starts_with("https://") {
+            return Err(anyhow!(
+                "server URI must start with http:// or https:// (got {:?})",
+                server_uri
+            ));
+        }
+
+        let api_key_path = cli
+            .api_key
+            .clone()
+            .or_else(|| cfg.api_key.clone())
+            .unwrap_or_else(|| PathBuf::from("/etc/tas_agent/api-key"));
+        let policy_domain = cli
+            .policy_id
+            .clone()
+            .or_else(|| cfg.policy_id.clone())
+            .ok_or_else(|| anyhow!("policy-domain is required for certify flow"))?;
+        let cert_path = cli
+            .cert_path
+            .clone()
+            .or_else(|| cfg.cert_path.clone())
+            .unwrap_or_else(|| PathBuf::from("/etc/tas_agent/root_cert.pem"));
+        let retry_config = RetryConfig {
+            max_retries: cli.max_retries.or(cfg.max_retries).unwrap_or(3),
+            min_backoff_secs: cli
+                .retry_min_backoff_secs
+                .or(cfg.retry_min_backoff_secs)
+                .unwrap_or(1),
+            max_backoff_secs: cli
+                .retry_max_backoff_secs
+                .or(cfg.retry_max_backoff_secs)
+                .unwrap_or(30),
+        };
+
+        Ok(Self {
+            server_uri,
+            api_key_path,
+            policy_domain,
+            cert_path,
+            retry_config,
+            #[cfg(feature = "gpu-nvidia")]
+            gpu_enabled: !cli.no_gpu && !cfg.no_gpu.unwrap_or(false),
+        })
+    }
+}
+
+fn certify_report_data(
+    nonce: &str,
+    public_key_pkcs1_der: &[u8],
+    component_hashes: &[u8],
+) -> Vec<u8> {
+    #[cfg(feature = "gpu-nvidia")]
+    if !component_hashes.is_empty() {
+        return compute_report_data_binding_with_components(
+            nonce.as_bytes(),
+            public_key_pkcs1_der,
+            component_hashes,
+        );
+    }
+
+    #[cfg(not(feature = "gpu-nvidia"))]
+    debug_assert!(component_hashes.is_empty());
+
+    compute_report_data_binding(nonce.as_bytes(), public_key_pkcs1_der)
 }
 
 /// Runs the certify/renew flow for the `certify` subcommand.
@@ -127,25 +215,9 @@ pub(super) async fn run(cli: &Cli, args: &CertifyArgs, cfg: &Config) -> Result<(
         Vec::new()
     };
 
-    let overrides = CliOverrides {
-        server_uri: cli.server_uri.clone(),
-        api_key: cli.api_key.clone(),
-        policy_id: cli.policy_id.clone(),
-        cert_path: cli.cert_path.clone(),
-        max_retries: cli.max_retries,
-        retry_min_backoff_secs: cli.retry_min_backoff_secs,
-        retry_max_backoff_secs: cli.retry_max_backoff_secs,
-    };
+    let settings = CertifySettings::resolve(cli, cfg)?;
 
-    let cert_bundle_pem = certify_flow(
-        cli.config.clone(),
-        Some(overrides),
-        Some(write_dir),
-        mode,
-        common_name,
-        sans,
-    )
-    .await?;
+    let cert_bundle_pem = certify_flow(settings, write_dir, mode, common_name, sans).await?;
 
     if cli.debug {
         use std::io::Write;
@@ -158,67 +230,17 @@ pub(super) async fn run(cli: &Cli, args: &CertifyArgs, cfg: &Config) -> Result<(
 }
 
 async fn certify_flow(
-    config_path: Option<PathBuf>,
-    overrides: Option<CliOverrides>,
-    write_dir: Option<PathBuf>,
+    settings: CertifySettings,
+    write_dir: PathBuf,
     mode: CertifyMode,
     common_name: Option<String>,
     sans: Vec<SanEntry>,
 ) -> Result<String> {
     warn!("EXPERIMENTAL: certify/renew lifecycle is not production-ready");
-    let cfg = load_config(config_path)?;
-    let ovr = overrides.unwrap_or(CliOverrides {
-        server_uri: None,
-        api_key: None,
-        policy_id: None,
-        cert_path: None,
-        max_retries: None,
-        retry_min_backoff_secs: None,
-        retry_max_backoff_secs: None,
-    });
+    debug!("Retry config: {:?}", settings.retry_config);
 
-    let write_dir = write_dir.ok_or_else(|| anyhow!("write_dir is required"))?;
-
-    //TODO - refactor to share more code with fetch_key(), e.g. config loading, retry config, TAS version check, nonce retrieval, etc.
-
-    let server_uri = ovr
-        .server_uri
-        .or(cfg.server_uri)
-        .ok_or_else(|| anyhow!("server URI is required"))?;
-
-    if !server_uri.starts_with("http://") && !server_uri.starts_with("https://") {
-        return Err(anyhow!(
-            "server URI must start with http:// or https:// (got {:?})",
-            server_uri
-        ));
-    }
-
-    let api_key_path = ovr
-        .api_key
-        .or(cfg.api_key)
-        .unwrap_or_else(|| PathBuf::from("/etc/tas_agent/api-key"));
-
-    let cert_path = ovr
-        .cert_path
-        .or(cfg.cert_path)
-        .unwrap_or_else(|| PathBuf::from("/etc/tas_agent/root_cert.pem"));
-
-    let retry_config = RetryConfig {
-        max_retries: ovr.max_retries.or(cfg.max_retries).unwrap_or(3),
-        min_backoff_secs: ovr
-            .retry_min_backoff_secs
-            .or(cfg.retry_min_backoff_secs)
-            .unwrap_or(1),
-        max_backoff_secs: ovr
-            .retry_max_backoff_secs
-            .or(cfg.retry_max_backoff_secs)
-            .unwrap_or(30),
-    };
-
-    debug!("Retry config: {:?}", retry_config);
-
-    let api_key = read_to_string(api_key_path.clone())
-        .with_context(|| format!("unable to read API key from {:?}", api_key_path))?
+    let api_key = read_to_string(settings.api_key_path.clone())
+        .with_context(|| format!("unable to read API key from {:?}", settings.api_key_path))?
         .trim()
         .to_string();
 
@@ -253,26 +275,42 @@ async fn certify_flow(
         .map_err(|e| anyhow!("failed to build CSR: {}", e))?;
     debug!("Generated certify CSR subject CN: {}", common_name);
 
-    match tas_get_version(&server_uri, &api_key, cert_path.clone(), &retry_config).await {
+    match tas_get_version(
+        &settings.server_uri,
+        &api_key,
+        settings.cert_path.clone(),
+        &settings.retry_config,
+    )
+    .await
+    {
         Ok(version) => debug!("TEE Attestation Server Version: {}", version),
         Err(err) => return Err(anyhow!("TAS Version Error: {}", err)),
     }
 
-    // The alpha API calls this field policy-domain; keep using the existing
-    // policy_id config/CLI name for compatibility with the key-fetch flow.
-    let policy_domain = ovr
-        .policy_id
-        .or(cfg.policy_id)
-        .ok_or_else(|| anyhow!("policy-domain is required for certify flow"))?;
-
-    let nonce = tas_get_alpha_nonce(&server_uri, &api_key, cert_path.clone(), &retry_config)
-        .await
-        .map_err(|e| anyhow!("TAS Alpha Nonce Error: {}", e))?;
+    let nonce = tas_get_alpha_nonce(
+        &settings.server_uri,
+        &api_key,
+        settings.cert_path.clone(),
+        &settings.retry_config,
+    )
+    .await
+    .map_err(|e| anyhow!("TAS Alpha Nonce Error: {}", e))?;
     // Match TAS vm_verify(): report_data binding uses nonce || PKCS#1 public-key DER.
     let pubkey_der = agent_key
         .public_key_to_der()
         .map_err(|e| anyhow!("Failed to get public key DER: {}", e))?;
-    let binding = compute_report_data_binding(nonce.as_bytes(), &pubkey_der);
+
+    #[cfg(feature = "gpu-nvidia")]
+    let (gpu_evidence, component_hashes) = if settings.gpu_enabled {
+        let (entries, hashes) = gpu::collect(&nonce)?;
+        (Some(entries), hashes)
+    } else {
+        (None, Vec::new())
+    };
+    #[cfg(not(feature = "gpu-nvidia"))]
+    let component_hashes = Vec::new();
+
+    let binding = certify_report_data(&nonce, &pubkey_der, &component_hashes);
     debug!(
         "Certify report data binding (hex): {}",
         hex::encode(&binding)
@@ -287,16 +325,19 @@ async fn certify_flow(
     debug!("Certify TEE Type: {}", tee_type);
 
     let issued = tas_certify(
-        &server_uri,
+        &settings.server_uri,
         &api_key,
         &nonce,
         &tee_evidence,
         &tee_type,
         renew_cert.as_deref(),
         &csr_pem,
-        &policy_domain,
-        cert_path,
-        &retry_config,
+        &settings.policy_domain,
+        settings.cert_path,
+        &settings.retry_config,
+        #[cfg(feature = "gpu-nvidia")]
+        gpu_evidence.as_deref(),
+        #[cfg(not(feature = "gpu-nvidia"))]
         None,
     )
     .await
@@ -340,4 +381,177 @@ async fn certify_flow(
     }
 
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn parse_cli(args: &[&str]) -> Cli {
+        let mut all_args = vec!["tas_agent"];
+        all_args.extend_from_slice(args);
+        Cli::try_parse_from(all_args).unwrap()
+    }
+
+    #[test]
+    fn certify_settings_cli_overrides_config() {
+        let cli = parse_cli(&[
+            "--server-uri",
+            "https://cli.example",
+            "--api-key",
+            "/cli/api-key",
+            "--policy-id",
+            "cli-policy",
+            "--cert-path",
+            "/cli/root.pem",
+            "--max-retries",
+            "9",
+            "--retry-min-backoff-secs",
+            "4",
+            "--retry-max-backoff-secs",
+            "40",
+        ]);
+        let cfg: Config = toml::from_str(
+            r#"
+server_uri = "https://config.example"
+api_key = "/config/api-key"
+policy_id = "config-policy"
+cert_path = "/config/root.pem"
+max_retries = 2
+retry_min_backoff_secs = 1
+retry_max_backoff_secs = 10
+"#,
+        )
+        .unwrap();
+
+        let settings = CertifySettings::resolve(&cli, &cfg).unwrap();
+
+        assert_eq!(settings.server_uri, "https://cli.example");
+        assert_eq!(settings.api_key_path, PathBuf::from("/cli/api-key"));
+        assert_eq!(settings.policy_domain, "cli-policy");
+        assert_eq!(settings.cert_path, PathBuf::from("/cli/root.pem"));
+        assert_eq!(settings.retry_config.max_retries, 9);
+        assert_eq!(settings.retry_config.min_backoff_secs, 4);
+        assert_eq!(settings.retry_config.max_backoff_secs, 40);
+    }
+
+    #[test]
+    fn certify_settings_use_config_and_builtin_defaults() {
+        let cli = parse_cli(&[]);
+        let cfg: Config = toml::from_str(
+            r#"
+server_uri = "http://config.example"
+policy_id = "config-policy"
+"#,
+        )
+        .unwrap();
+
+        let settings = CertifySettings::resolve(&cli, &cfg).unwrap();
+
+        assert_eq!(settings.server_uri, "http://config.example");
+        assert_eq!(
+            settings.api_key_path,
+            PathBuf::from("/etc/tas_agent/api-key")
+        );
+        assert_eq!(settings.policy_domain, "config-policy");
+        assert_eq!(
+            settings.cert_path,
+            PathBuf::from("/etc/tas_agent/root_cert.pem")
+        );
+        assert_eq!(settings.retry_config.max_retries, 3);
+        assert_eq!(settings.retry_config.min_backoff_secs, 1);
+        assert_eq!(settings.retry_config.max_backoff_secs, 30);
+    }
+
+    #[test]
+    fn certify_settings_validate_required_values() {
+        let missing_server = CertifySettings::resolve(&parse_cli(&[]), &Config::default())
+            .err()
+            .unwrap();
+        assert_eq!(missing_server.to_string(), "server URI is required");
+
+        let malformed_server = CertifySettings::resolve(
+            &parse_cli(&["--server-uri", "config.example", "--policy-id", "policy"]),
+            &Config::default(),
+        )
+        .err()
+        .unwrap();
+        assert!(malformed_server
+            .to_string()
+            .contains("server URI must start with http:// or https://"));
+
+        let missing_policy = CertifySettings::resolve(
+            &parse_cli(&["--server-uri", "https://config.example"]),
+            &Config::default(),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(
+            missing_policy.to_string(),
+            "policy-domain is required for certify flow"
+        );
+    }
+
+    #[test]
+    fn cpu_only_report_data_uses_plain_binding() {
+        let nonce = "0123456789abcdef";
+        let public_key = b"public-key";
+
+        let actual = certify_report_data(nonce, public_key, &[]);
+        let expected = compute_report_data_binding(nonce.as_bytes(), public_key);
+
+        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), 64);
+    }
+
+    #[cfg(feature = "gpu-nvidia")]
+    #[test]
+    fn gpu_report_data_uses_component_hash_order() {
+        let nonce = "0123456789abcdef";
+        let public_key = b"public-key";
+        let mut hashes = vec![1_u8; 64];
+        hashes.extend(vec![2_u8; 64]);
+
+        let actual = certify_report_data(nonce, public_key, &hashes);
+        let expected =
+            compute_report_data_binding_with_components(nonce.as_bytes(), public_key, &hashes);
+
+        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), 64);
+
+        let mut reversed = hashes.clone();
+        reversed.reverse();
+        assert_ne!(actual, certify_report_data(nonce, public_key, &reversed));
+    }
+
+    #[cfg(feature = "gpu-nvidia")]
+    #[test]
+    fn certify_settings_resolve_gpu_enablement() {
+        for (cli_disabled, config_disabled, expected_enabled) in [
+            (false, false, true),
+            (true, false, false),
+            (false, true, false),
+            (true, true, false),
+        ] {
+            let mut args = vec![
+                "--server-uri",
+                "https://config.example",
+                "--policy-id",
+                "policy",
+            ];
+            if cli_disabled {
+                args.push("--no-gpu");
+            }
+            let cli = parse_cli(&args);
+            let cfg = Config {
+                no_gpu: Some(config_disabled),
+                ..Default::default()
+            };
+
+            let settings = CertifySettings::resolve(&cli, &cfg).unwrap();
+
+            assert_eq!(settings.gpu_enabled, expected_enabled);
+        }
+    }
 }
